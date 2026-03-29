@@ -689,7 +689,7 @@ def test(loader, epoch):
                 loss = loss_op(out, data.y.to(device)) + loss1 * args.hinge
 
             else:
-                 target = data.y[data.flexible_idx.bool()].to(device).float()
+                target = data.y[data.flexible_idx.bool()].to(device).float()
                 loss = geopronet_loss(
                     data.to(device),
                     out.to(device).float(),
