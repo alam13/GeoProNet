@@ -69,6 +69,8 @@ parser.add_argument("--use_novel_features", help="expect 13D edge features from 
 parser.add_argument("--lambda_dihedral", help="weight for direct dihedral supervision", type=float, default=0.1)
 parser.add_argument("--torsion_iters", help="number of iterative torsion updates", type=int, default=1)
 parser.add_argument("--use_alpha_channel", help="concatenate alpha_ijk edge side tensor into message passing edge_attr", default=False, action='store_true')
+parser.add_argument("--metrics_file", help="path to epoch-level metrics jsonl", type=str, default='none')
+parser.add_argument("--metrics_per_complex_file", help="path to per-complex metrics jsonl", type=str, default='none')
 
 args = parser.parse_args()
 print(args)
@@ -772,7 +774,34 @@ def test(loader, epoch):
 
     avg_rmsd_per_pdb = sum([r / d for r, d in zip(rmsd_per_pdb[:diff_complex], num_pose_per_pdb[:diff_complex])]) / diff_complex
     avg_rmsd_per_pdb_in = sum([r / d for r, d in zip(rmsd_per_pdb_in[:diff_complex], num_pose_per_pdb[:diff_complex])]) / diff_complex
-    return total_loss / pose_idx, avg_rmsd_per_pdb, avg_rmsd_per_pdb_in
+    #return total_loss / pose_idx, avg_rmsd_per_pdb, avg_rmsd_per_pdb_in
+    rmsd_arr = np.array(all_rmsds, dtype=np.float32) if len(all_rmsds) else np.array([0.0], dtype=np.float32)
+    metrics = {
+        "val_loss": float(total_loss / pose_idx),
+        "rmsd_mean": float(rmsd_arr.mean()),
+        "rmsd_median": float(np.median(rmsd_arr)),
+        "rmsd_std": float(rmsd_arr.std()),
+        "rmsd_p90": float(np.percentile(rmsd_arr, 90)),
+        "sr_2a": float((rmsd_arr <= 2.0).mean()),
+        "sr_5a": float((rmsd_arr <= 5.0).mean()),
+        "avg_rmsd_per_complex": float(avg_rmsd_per_pdb),
+        "avg_input_rmsd_per_complex": float(avg_rmsd_per_pdb_in),
+        "num_poses": int(pose_idx),
+        "num_complexes": int(diff_complex),
+        "avg_poses_per_complex": float(pose_idx / max(diff_complex, 1)),
+    }
+
+    per_complex = []
+    for jj in range(diff_complex):
+        denom = max(num_pose_per_pdb[jj], 1)
+        per_complex.append({
+            "pdb": str(pdbs[jj]) if jj < len(pdbs) else str(jj),
+            "num_poses": int(num_pose_per_pdb[jj]),
+            "avg_rmsd": float(rmsd_per_pdb[jj] / denom),
+            "avg_input_rmsd": float(rmsd_per_pdb_in[jj] / denom),
+        })
+
+    return metrics, per_complex
 
 
 
@@ -787,8 +816,13 @@ best_epoch = 0
 for epoch in range(args.start_epoch, args.start_epoch + args.epoch):
     loss1 = train()
     print(f"Train Loss: {loss1}")
-    loss2, rmsd, rmsd_in = test(test_loader, epoch)
-    print(f"Epoch: {epoch} Train Loss: {loss1} Validation Loss: {loss2}  Avg RMSD: {rmsd}")
+    #loss2, rmsd, rmsd_in = test(test_loader, epoch)
+    #print(f"Epoch: {epoch} Train Loss: {loss1} Validation Loss: {loss2}  Avg RMSD: {rmsd}")
+    eval_metrics, per_complex_metrics = test(test_loader, epoch)
+    loss2 = eval_metrics["val_loss"]
+    rmsd = eval_metrics["avg_rmsd_per_complex"]
+    rmsd_in = eval_metrics["avg_input_rmsd_per_complex"]
+    print(f"Epoch: {epoch} Train Loss: {loss1} Validation Loss: {loss2}  Avg RMSD: {rmsd} SR@2A: {eval_metrics['sr_2a']} SR@5A: {eval_metrics['sr_5a']}")
     #print(f"Epoch: {epoch} Proposed Loss: {ploss} Kabsch Loss: {kloss}  Model Loss: {mloss}")
     torch.cuda.empty_cache()
     if epoch <= 1:
@@ -798,7 +832,20 @@ for epoch in range(args.start_epoch, args.start_epoch + args.epoch):
                 f.write(f"Avg RMSD of inputs: {rmsd_in}\n")
     if args.output != 'none':
         with open(args.output, 'a') as f:
-            f.write(f"Epoch: {epoch} Train Loss: {loss1} Validation Loss: {loss2}  Avg RMSD: {rmsd}\n")
+             f.write(f"Epoch: {epoch} Train Loss: {loss1} Validation Loss: {loss2}  Avg RMSD: {rmsd} SR@2A: {eval_metrics['sr_2a']} SR@5A: {eval_metrics['sr_5a']}\n")
+            #f.write(f"Epoch: {epoch} Proposed Loss: {ploss} Kabsch Loss: {kloss}  Model Loss: {mloss}\n")
+    if args.metrics_file != 'none':
+        os.makedirs(os.path.dirname(args.metrics_file), exist_ok=True) if os.path.dirname(args.metrics_file) else None
+        with open(args.metrics_file, 'a') as mf:
+            payload = {"epoch": epoch, "train_loss": float(loss1), **eval_metrics}
+            mf.write(json.dumps(payload) + "\n")
+    if args.metrics_per_complex_file != 'none':
+        os.makedirs(os.path.dirname(args.metrics_per_complex_file), exist_ok=True) if os.path.dirname(args.metrics_per_complex_file) else None
+        with open(args.metrics_per_complex_file, 'a') as pf:
+            for row in per_complex_metrics:
+                row_payload = {"epoch": epoch, **row}
+                pf.write(json.dumps(row_payload) + "\n")
+            #f.write(f"Epoch: {epoch} Train Loss: {loss1} Validation Loss: {loss2}  Avg RMSD: {rmsd}\n")
             #f.write(f"Epoch: {epoch} Proposed Loss: {ploss} Kabsch Loss: {kloss}  Model Loss: {mloss}\n")
     if epoch > 3 and (min_rmsd > rmsd) :
         saved_model_dir = os.path.join(args.model_dir, f'model_{epoch}.pt')
