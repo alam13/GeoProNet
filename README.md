@@ -32,3 +32,6 @@ For explicit torsion updates with rotatable-bond supervision, use:
 
 ```bash
 python train_coor.py --gpu_id=0 --n_graph_layer=4 --d_graph_layer=256 --start_epoch=1 --epoch=350 --flexible --model_dir=KtransPose_tmp/models_torsion --data_path=KtransPose_tmp/pdbbind_rmsd_srand_coor2 --heads=1 --batch_size=1 --model_type=Net_coor_torsion --residue --edge_dim=13 --loss_reduction=mean --output=KtransPose_tmp/output_torsion --tot_seed=1 --lambda_align=0.5 --lambda_coord=0.5 --lambda_steric=0.05 --lambda_torsion=0.02 --lambda_dihedral=0.1 --torsion_iters=2 --use_novel_features
+```
+
+To include explicit angle side-channel (`alpha_ijk`) in message passing, add `--use_alpha_channel` and set `--edge_dim=14`.
