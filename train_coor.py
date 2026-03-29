@@ -733,7 +733,7 @@ def test(loader, epoch):
             edge_attr = build_edge_attr(data.to(device))
             out = model(data.x.to(device), data.edge_index.to(device), edge_attr)
             loss = loss_op(out, data.y.to(device)) 
-            rmsds = F.mse_loss(data.y, out.cpu()[data.flexible_idx.bool()], reduction='sum').item(
+            rmsds = F.mse_loss(data.y, out.cpu()[data.flexible_idx.bool()], reduction='sum').item()
             total_rmsd += math.sqrt(rmsds / num_flexible_atoms)
             all_rmsds.append(math.sqrt(rmsds / num_flexible_atoms))
 
