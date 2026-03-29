@@ -151,7 +151,7 @@ class PDBBind(InMemoryDataset):
                     indptr = torch.LongTensor(indptr)
                     indices = torch.LongTensor(indices)
                     dist = torch.tensor(dist, dtype=torch.float)
-                    row_idx = _row_idx_from_node_index(indptr, len(indices)
+                    row_idx = _row_idx_from_node_index(indptr, len(indices))
                     edge_index = torch.stack((row_idx, indices), dim=0)
                     
                     # No edge attr to save space
@@ -877,7 +877,7 @@ class PDBBindScreen(InMemoryDataset):
                     dist = dist.reshape(dist.size()[0], -1)
                     indptr = torch.LongTensor(indptr)
                     indices = torch.LongTensor(indices)
-                    row_idx = _row_idx_from_node_index(indptr, len(indices)
+                    row_idx = _row_idx_from_node_index(indptr, len(indices))
                     edge_index = torch.stack((row_idx, indices), dim=0)
                     
                     if model is not None:
