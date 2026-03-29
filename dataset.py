@@ -17,6 +17,27 @@ from model import Net_coor
 SPACE = 100
 BOND_TH = 6.0
 
+def _compute_edge_alpha(edge_index, coords):
+    """Per-edge angle feature alpha_ijk using one local triplet at source node."""
+    src = edge_index[0]
+    dst = edge_index[1]
+    num_edges = src.size(0)
+    alpha = torch.zeros((num_edges, 1), dtype=coords.dtype)
+    for e in range(num_edges):
+        i = src[e].item()
+        j = dst[e].item()
+        neigh = dst[src == i]
+        neigh = neigh[neigh != j]
+        if neigh.numel() == 0:
+            continue
+        k = neigh[0].item()
+        v1 = coords[j] - coords[i]
+        v2 = coords[k] - coords[i]
+        n1 = torch.norm(v1) + 1e-8
+        n2 = torch.norm(v2) + 1e-8
+        cosang = torch.clamp(torch.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        alpha[e, 0] = torch.acos(cosang)
+    return alpha
 
 class PDBBind(InMemoryDataset):
 
@@ -382,6 +403,7 @@ class PDBBindCoor(InMemoryDataset):
                     # data.energy = torch.tensor([energies[idx]], dtype=torch.float)
                     data.bonds = bonds
                     data.dist = dist
+                    data.alpha = _compute_edge_alpha(edge_index, x[:, -3:])
                     data.pdb = pdb
                     data.flexible_idx = flexible_idx
                     # data.flexible_idy = flexible_idy
