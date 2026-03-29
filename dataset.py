@@ -17,6 +17,29 @@ from model import Net_coor
 SPACE = 100
 BOND_TH = 6.0
 
+def _row_idx_from_node_index(node_index, num_edges):
+    """
+    Convert per-node cumulative edge counts (without leading 0) to row indices.
+    This is a local replacement for torch_sparse dependency calls.
+    """
+    if node_index.numel() == 0:
+        return torch.empty((0,), dtype=torch.long)
+    counts = torch.empty_like(node_index)
+    counts[0] = node_index[0]
+    if node_index.numel() > 1:
+        counts[1:] = node_index[1:] - node_index[:-1]
+    rows = torch.arange(node_index.numel(), dtype=torch.long)
+    row_idx = torch.repeat_interleave(rows, counts.clamp(min=0))
+    if row_idx.numel() != num_edges:
+        # fallback-safe: trim/pad to expected edge length
+        if row_idx.numel() > num_edges:
+            row_idx = row_idx[:num_edges]
+        else:
+            pad = torch.full((num_edges - row_idx.numel(),), rows[-1], dtype=torch.long)
+            row_idx = torch.cat([row_idx, pad], dim=0)
+    return row_idx
+
+
 def _compute_edge_alpha(edge_index, coords):
     """Per-edge angle feature alpha_ijk using one local triplet at source node."""
     src = edge_index[0]
@@ -128,7 +151,7 @@ class PDBBind(InMemoryDataset):
                     indptr = torch.LongTensor(indptr)
                     indices = torch.LongTensor(indices)
                     dist = torch.tensor(dist, dtype=torch.float)
-                    row_idx = torch.ops.torch_sparse.ind2ptr(indptr,len(indices))[1:]
+                    row_idx = _row_idx_from_node_index(indptr, len(indices)
                     edge_index = torch.stack((row_idx, indices), dim=0)
                     
                     # No edge attr to save space
@@ -249,7 +272,7 @@ class PDBBind_test(InMemoryDataset):
             indptr = torch.LongTensor(indptr)
             indices = torch.LongTensor(indices)
             dist = torch.tensor(dist, dtype=torch.float)
-            row_idx = torch.ops.torch_sparse.ind2ptr(indptr,len(indices))[1:]
+            row_idx = _row_idx_from_node_index(indptr, len(indices))
             edge_index = torch.stack((row_idx, indices), dim=0)
             
             # No edge attr to save space
@@ -379,7 +402,7 @@ class PDBBindCoor(InMemoryDataset):
                     indices = torch.LongTensor(indices)
                     # dist[:, :3] *= 10
                     dist = torch.tensor(dist, dtype=torch.float)
-                    row_idx = torch.ops.torch_sparse.ind2ptr(indptr,len(indices))[1:]
+                    row_idx = _row_idx_from_node_index(indptr, len(indices))
                     edge_index = torch.stack((row_idx, indices), dim=0)
                     
 
@@ -403,6 +426,7 @@ class PDBBindCoor(InMemoryDataset):
                     # data.energy = torch.tensor([energies[idx]], dtype=torch.float)
                     data.bonds = bonds
                     data.dist = dist
+                    
                     data.alpha = _compute_edge_alpha(edge_index, x[:, -3:])
                     data.pdb = pdb
                     data.flexible_idx = flexible_idx
@@ -853,7 +877,7 @@ class PDBBindScreen(InMemoryDataset):
                     dist = dist.reshape(dist.size()[0], -1)
                     indptr = torch.LongTensor(indptr)
                     indices = torch.LongTensor(indices)
-                    row_idx = torch.ops.torch_sparse.ind2ptr(indptr,len(indices))[1:]
+                    row_idx = _row_idx_from_node_index(indptr, len(indices)
                     edge_index = torch.stack((row_idx, indices), dim=0)
                     
                     if model is not None:
@@ -1039,7 +1063,7 @@ class PDBBindScreen2(InMemoryDataset):
                     dist = dist.reshape(dist.size()[0], -1)
                     indptr = torch.LongTensor(indptr)
                     indices = torch.LongTensor(indices)
-                    row_idx = torch.ops.torch_sparse.ind2ptr(indptr,len(indices))[1:]
+                    row_idx = _row_idx_from_node_index(indptr, len(indices))
                     edge_index = torch.stack((row_idx, indices), dim=0)
                     
                     if model is not None:
