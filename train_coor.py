@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from dataset import PDBBindCoor
 from model import loss_fn_kd, get_soft_label, loss_fn_dir, loss_fn_cos
-import plot
+import matplotlib.pyplot as plt
 
 
 parser = argparse.ArgumentParser()
