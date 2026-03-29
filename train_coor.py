@@ -68,13 +68,15 @@ parser.add_argument("--lambda_torsion", help="weight for torsion smoothness regu
 parser.add_argument("--use_novel_features", help="expect 13D edge features from novel data path", default=False, action='store_true')
 parser.add_argument("--lambda_dihedral", help="weight for direct dihedral supervision", type=float, default=0.1)
 parser.add_argument("--torsion_iters", help="number of iterative torsion updates", type=int, default=1)
+parser.add_argument("--use_alpha_channel", help="concatenate alpha_ijk edge side tensor into message passing edge_attr", default=False, action='store_true')
 
 args = parser.parse_args()
 print(args)
 
-if args.use_novel_features and args.edge_dim != 13:
-    raise ValueError("GeoProNet novel mode expects --edge_dim=13. Please regenerate data with --use_novel_features and train with edge_dim=13.")
-
+if args.use_novel_features and args.edge_dim != 13 and not args.use_alpha_channel:
+    raise ValueError("GeoProNet novel mode expects --edge_dim=13. If you enable --use_alpha_channel then use --edge_dim=14.")
+if args.use_novel_features and args.use_alpha_channel and args.edge_dim != 14:
+    raise ValueError("GeoProNet novel+alpha mode expects --edge_dim=14.")
 if args.atomwise:
     args.batch_size = 1
 
@@ -150,6 +152,10 @@ def _dir_2_coor2(out, length):
     ans = torch.stack([x, y, z], 1)
 
     return ans*length
+
+def _dir_2_coor(out, length):
+    """Backward-compatible alias used by legacy atomwise branch."""
+    return _dir_2_coor2(out, length)
 
 
 
@@ -331,6 +337,22 @@ def _rotate_points(points, origin, axis, theta):
     return rot + origin
 
 
+def _downstream_subtree(graph, root, blocked):
+    stack = [root]
+    seen = {blocked}
+    out = []
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        out.append(cur)
+        for nei in graph.get(cur, []):
+            if nei not in seen:
+                stack.append(nei)
+    return out
+
+
 def apply_torsion_updates(coords, graph, delta_theta, iters=1):
     out = coords.clone()
     bonds = _rotatable_bonds(graph)
@@ -339,11 +361,11 @@ def apply_torsion_updates(coords, graph, delta_theta, iters=1):
     for _ in range(max(1, iters)):
         for i, j in bonds:
             axis = out[j] - out[i]
-            downstream = [n for n in graph[j] if n != i]
+            downstream = _downstream_subtree(graph, j, i)
             if not downstream:
                 continue
             idx = torch.tensor(downstream, dtype=torch.long, device=out.device)
-            theta = delta_theta[(i + j) // 2]
+            theta = 0.5 * (delta_theta[i] + delta_theta[j])
             out[idx] = _rotate_points(out[idx], out[j], axis, theta)
     return out
 
@@ -399,6 +421,11 @@ def geopronet_loss(data, pred, target, flexible_mask, torsion_node=None):
 
 
 from torch_geometric.utils import add_self_loops
+def build_edge_attr(data):
+    edge_attr = data.dist.float()
+    if args.use_alpha_channel and hasattr(data, 'alpha'):
+        edge_attr = torch.cat([edge_attr, data.alpha.float()], dim=1)
+    return edge_attr
 
 def update_input_data(data, pred):
     # Assuming pred is a tensor containing the predicted x, y, z coordinates for flexible atoms
@@ -461,7 +488,8 @@ def train():
                     ed = ((idx + 1) * flexible_len) // args.atomwise
                     atom_idx = all_atom_idx[st:ed]
                     optimizer.zero_grad()
-                    pred = model(data.x.to(device).float(), data.edge_index.to(device), data.dist.float())[atom_idx]
+                    edge_attr = build_edge_attr(data)
+                    pred = model(data.x.to(device).float(), data.edge_index.to(device), edge_attr)[atom_idx]
                     pred = _dir_2_coor(pred, args.step_len)
                     loss = loss_op(pred.to(device).float(), data.y[atom_idx])
                     avg_loss += loss.item()
@@ -480,11 +508,12 @@ def train():
                 
                     
                     if args.model_type == 'Net_coor_torsion':
-                        pred_all, torsion_node = model(data.x.to(device).float(), data.edge_index, data.dist.float())
+                        edge_attr = build_edge_attr(data)
+                        pred_all, torsion_node = model(data.x.to(device).float(), data.edge_index, edge_attr)
                         pred = pred_all[data.flexible_idx.bool()]
                     else:
-                        pred = model(data.x.to(device).float(), data.edge_index, data.dist.float())[data.flexible_idx.bool()]
-                    
+                        edge_attr = build_edge_attr(data)
+                        pred = model(data.x.to(device).float(), data.edge_index, edge_attr)[data.flexible_idx.bool()]
 
                     #if epoch ==150 or epoch == 250:
                         #updated_data = update_input_data(data.clone(), pred.cpu().detach())
@@ -509,7 +538,8 @@ def train():
                     length = data.y[data.flexible_idx.bool()].square().sum(1).sqrt().reshape(pred.size()[0],1)
                     loss = loss_op(pred, length)
                 elif args.model_type == 'Net_coor_cent':
-                    pred = model(data.x, data.edge_index, data.dist, data.batch, data.flexible_idx.bool())
+                    edge_attr = build_edge_attr(data)
+                    pred = model(data.x, data.edge_index, edge_attr, data.batch, data.flexible_idx.bool())
                     y = global_mean_pool(data.y[data.flexible_idx.bool()], data.batch[data.flexible_idx.bool()])
                     loss = loss_op(pred, y)
                 elif args.hinge != 0:
@@ -523,12 +553,12 @@ def train():
                     target = data.y[data.flexible_idx.bool()].to(device).float()
                     torsion_node = torsion_node if args.model_type == 'Net_coor_torsion' else None
                     loss = geopronet_loss(data, pred.to(device).float(), target, data.flexible_idx.bool(), torsion_node=torsion_node)
-
                     
 
 
             else:
-                pred = model(data.x, data.edge_index, data.dist)
+                edge_attr = build_edge_attr(data)
+                pred = model(data.x, data.edge_index, edge_attr)
                 loss = loss_op(pred, data.y)
             if args.loss == 'CosineEmbeddingLoss':
                 total_loss += loss.item() / pred.size()[0] * args.batch_size
@@ -616,18 +646,22 @@ def test(loader, epoch):
             print(f"num_flexible_atoms: {num_flexible_atoms}, data.x.size: {data.x.size()[0]}, data.y.size: {num_atoms}")
         if args.flexible:
             if args.model_type != 'Net_coor_cent':
-                                if args.model_type == 'Net_coor_torsion':
-                    out_all, torsion_node = model(data.x.to(device).float(), data.edge_index.to(device), data.dist.to(device).float())
+                if args.model_type == 'Net_coor_torsion':
+                    edge_attr = build_edge_attr(data.to(device))
+                    out_all, torsion_node = model(data.x.to(device).float(), data.edge_index.to(device), edge_attr)
                     out = out_all[data.flexible_idx.bool()]
                 else:
                     torsion_node = None
-                    out = model(data.x.to(device).float(), data.edge_index.to(device), data.dist.to(device).float())[data.flexible_idx.bool()]
+                    edge_attr = build_edge_attr(data.to(device))
+                    out = model(data.x.to(device).float(), data.edge_index.to(device), edge_attr)[data.flexible_idx.bool()]
+                                
                 
                 #out = _dir_2_coor(out, args.step_len)
                 #out = _dir_2_coor2(out, args.step_len)
             if args.class_dir:
                 #y = data.y[data.flexible_idx.bool()].gt(0).long().to(device)
-                y =  model(data.x.to(device), data.edge_index.to(device), data.dist.to(device))[data.flexible_idx.bool()]
+                edge_attr = build_edge_attr(data.to(device))
+                y =  model(data.x.to(device), data.edge_index.to(device), edge_attr)[data.flexible_idx.bool()]
                 y = y[:, 0] * 4 + y[:, 1] * 2 + y[:, 2]
                 loss = loss_op(out, y)
                 for i in range(8):
@@ -643,7 +677,8 @@ def test(loader, epoch):
                 loss = loss_op(out, length)
                 out = data.y.to(device)[data.flexible_idx.bool()]
             elif args.model_type == 'Net_coor_cent':
-                pred = model(data.x.to(device), data.edge_index.to(device), data.dist.to(device), data.batch.to(device), data.flexible_idx.bool().to(device)).cpu()
+                edge_attr = build_edge_attr(data.to(device))
+                pred = model(data.x.to(device), data.edge_index.to(device), edge_attr, data.batch.to(device), data.flexible_idx.bool().to(device)).cpu()
                 y = global_mean_pool(data.y[data.flexible_idx.bool()], data.batch[data.flexible_idx.bool()])
                 loss = loss_op(pred, y)
                 out = pred.repeat(num_flexible_atoms, 1)
@@ -654,7 +689,7 @@ def test(loader, epoch):
                 loss = loss_op(out, data.y.to(device)) + loss1 * args.hinge
 
             else:
-                target = data.y[data.flexible_idx.bool()].to(device).float()
+                 target = data.y[data.flexible_idx.bool()].to(device).float()
                 loss = geopronet_loss(
                     data.to(device),
                     out.to(device).float(),
@@ -687,7 +722,8 @@ def test(loader, epoch):
 
 
         else: # not flexible
-            out = model(data.x.to(device), data.edge_index.to(device), data.dist.to(device))
+            edge_attr = build_edge_attr(data.to(device))
+            out = model(data.x.to(device), data.edge_index.to(device), edge_attr)
             loss = loss_op(out, data.y.to(device)) 
             rmsds = F.mse_loss(data.y[data.flexible_idx.bool()], out.cpu()[data.flexible_idx.bool()], reduction='sum').item()
             total_rmsd += math.sqrt(rmsds / num_flexible_atoms)
