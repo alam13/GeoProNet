@@ -496,7 +496,7 @@ def geopronet_loss(data, pred, target, flexible_mask, torsion_node=None):
         + args.lambda_dihedral * dihedral_loss
     )
     return total
-
+    
 from torch_geometric.utils import add_self_loops
 def build_edge_attr(data):
     edge_attr = data.dist.float()
@@ -797,18 +797,10 @@ def test(loader, epoch):
                     torsion_abs_err_sum += float(t_mae.item())
                     torsion_sq_err_sum += float(t_rmse.item() ** 2)
                     torsion_count += 1
-            A= torch.tensor(out,requires_grad=True)
-            A = A.cpu().detach().numpy()
-            B= torch.tensor(data.y, requires_grad=True)
-            B = B.cpu().detach().numpy()
-                    
-            R,b = Kabsch_3D(A.T, B.T)
-            complex_pred = ((R @ A.T) + b).T
-            B = torch.tensor(B,requires_grad = True)
-            complex_pred = torch.tensor(complex_pred, requires_grad = True)
-            
-            #rmsds = math.sqrt(F.mse_loss(data.y.to(device), out, reduction='sum').cpu().item() / num_flexible_atoms)
-            rmsds = math.sqrt(F.mse_loss(B, complex_pred, reduction='sum').cpu().item() / num_flexible_atoms)
+            out_eval = torch.nan_to_num(out.to(device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+            y_eval = torch.nan_to_num(data.y.to(device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+            aligned_out = kabsch_align_torch(out_eval, y_eval)
+            rmsds = math.sqrt(F.mse_loss(y_eval, aligned_out, reduction='sum').cpu().item() / max(num_flexible_atoms, 1))
             
                         
             total_rmsd += rmsds
