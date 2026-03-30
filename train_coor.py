@@ -243,14 +243,24 @@ def kabsch_align_torch(predicted, target):
         predicted = predicted.float()
         target = target.float()
 
-        pred_centroid = predicted.mean(dim=0, keepdim=True)
-        target_centroid = target.mean(dim=0, keepdim=True)
+        finite_rows = torch.isfinite(predicted).all(dim=1) & torch.isfinite(target).all(dim=1)
+        if finite_rows.sum() < 3:
+            return torch.nan_to_num(predicted, nan=0.0, posinf=0.0, neginf=0.0).to(in_dtype)
 
-        pred_centered = predicted - pred_centroid
-        target_centered = target - target_centroid
+        predicted_f = predicted[finite_rows]
+        target_f = target[finite_rows]
+
+        pred_centroid = predicted_f.mean(dim=0, keepdim=True)
+        target_centroid = target_f.mean(dim=0, keepdim=True)
+
+        pred_centered = predicted_f - pred_centroid
+        target_centered = target_f - target_centroid
 
         h = pred_centered.transpose(0, 1) @ target_centered
-        u, s, v_t = torch.linalg.svd(h)
+        try:
+            u, _, v_t = torch.linalg.svd(h)
+        except RuntimeError:
+            return torch.nan_to_num(predicted, nan=0.0, posinf=0.0, neginf=0.0).to(in_dtype)
         r = v_t.transpose(0, 1) @ u.transpose(0, 1)
 
         if torch.det(r) < 0:
@@ -259,7 +269,9 @@ def kabsch_align_torch(predicted, target):
             r = v_t.transpose(0, 1) @ u.transpose(0, 1)
 
         t = target_centroid.transpose(0, 1) - r @ pred_centroid.transpose(0, 1)
-        aligned = (r @ predicted.transpose(0, 1) + t).transpose(0, 1)
+        aligned = torch.nan_to_num(predicted, nan=0.0, posinf=0.0, neginf=0.0)
+        aligned_f = (r @ predicted_f.transpose(0, 1) + t).transpose(0, 1)
+        aligned[finite_rows] = aligned_f
     return aligned.to(in_dtype)
 
 
@@ -283,6 +295,29 @@ def steric_clash_penalty(data, pred, flexible_mask):
     d = (pred_coor[src_idx] - pred_coor[dst_idx]).square().sum(dim=1).sqrt()
     penalty = torch.relu(args.steric_cutoff - d).square().mean()
     return penalty
+
+
+def clash_stats(data, pred, flexible_mask):
+    """Return (clash_rate, clash_penalty) for ligand-protein contacts."""
+    if data.dist.size(0) == 0:
+        z = pred.new_tensor(0.0)
+        return z, z
+
+    src = data.edge_index[0]
+    dst = data.edge_index[1]
+    ligand_to_protein = flexible_mask[src] & (~flexible_mask[dst])
+    if ligand_to_protein.sum() == 0:
+        z = pred.new_tensor(0.0)
+        return z, z
+
+    src_idx = src[ligand_to_protein]
+    dst_idx = dst[ligand_to_protein]
+    pred_coor = data.x[:, -3:].clone()
+    pred_coor[flexible_mask] = pred
+    d = (pred_coor[src_idx] - pred_coor[dst_idx]).square().sum(dim=1).sqrt()
+    clash_rate = (d < args.steric_cutoff).float().mean()
+    clash_pen = torch.relu(args.steric_cutoff - d).square().mean()
+    return clash_rate, clash_pen
 
 
 def torsion_smoothness_penalty(data, pred, flexible_mask):
@@ -407,7 +442,37 @@ def dihedral_supervision_loss(data, pred_abs, target_abs, flexible_mask, torsion
     return torch.stack(losses).mean()
 
 
+def torsion_error_metrics(data, pred_abs, target_abs, flexible_mask):
+    """Return (MAE, angular_RMSE) on ligand rotatable bond dihedrals."""
+    graph = _bond_graph_from_data(data, flexible_mask)
+    bonds = _rotatable_bonds(graph)
+    if len(bonds) == 0:
+        z = pred_abs.new_tensor(0.0)
+        return z, z
+
+    diffs = []
+    for i, j in bonds:
+        left = [n for n in graph[i] if n != j]
+        right = [n for n in graph[j] if n != i]
+        if not left or not right:
+            continue
+        u = left[0]
+        v = right[0]
+        p_ang = _dihedral_torch(pred_abs[u], pred_abs[i], pred_abs[j], pred_abs[v])
+        t_ang = _dihedral_torch(target_abs[u], target_abs[i], target_abs[j], target_abs[v])
+        diff = torch.atan2(torch.sin(p_ang - t_ang), torch.cos(p_ang - t_ang))
+        diffs.append(diff)
+    if not diffs:
+        z = pred_abs.new_tensor(0.0)
+        return z, z
+    diffs = torch.stack(diffs)
+    return diffs.abs().mean(), diffs.square().mean().sqrt()
+
+
 def geopronet_loss(data, pred, target, flexible_mask, torsion_node=None):
+    pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
     aligned = kabsch_align_torch(pred, target)
     align_loss = F.l1_loss(aligned, target)
     coord_loss = F.mse_loss(pred, target)
@@ -432,13 +497,13 @@ def geopronet_loss(data, pred, target, flexible_mask, torsion_node=None):
     )
     return total
 
-
 from torch_geometric.utils import add_self_loops
 def build_edge_attr(data):
     edge_attr = data.dist.float()
     if args.use_alpha_channel and hasattr(data, 'alpha'):
         edge_attr = torch.cat([edge_attr, data.alpha.float()], dim=1)
     return edge_attr
+
 
 def update_input_data(data, pred):
     # Assuming pred is a tensor containing the predicted x, y, z coordinates for flexible atoms
@@ -634,6 +699,11 @@ def test(loader, epoch):
     rmsd_per_pdb_in = []
     pdb = ''
     pdbs = []
+    torsion_abs_err_sum = 0.0
+    torsion_sq_err_sum = 0.0
+    torsion_count = 0
+    clash_rate_sum = 0.0
+    clash_penalty_sum = 0.0
 
     pbar = tqdm(total=test_loader_size)
     pbar.set_description('Testing poses...')
@@ -712,6 +782,21 @@ def test(loader, epoch):
                     data.flexible_idx.bool().to(device),
                     torsion_node=torsion_node,
                 )
+                pred_clean = torch.nan_to_num(out.to(device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+                target_clean = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+                flex_mask = data.flexible_idx.bool().to(device)
+                c_rate, c_pen = clash_stats(data.to(device), pred_clean, flex_mask)
+                clash_rate_sum += float(c_rate.item())
+                clash_penalty_sum += float(c_pen.item())
+
+                if args.model_type == 'Net_coor_torsion' and torsion_node is not None:
+                    start = data.x.to(device)[flex_mask, -3:]
+                    pred_abs = start + pred_clean
+                    target_abs = start + target_clean
+                    t_mae, t_rmse = torsion_error_metrics(data.to(device), pred_abs, target_abs, flex_mask)
+                    torsion_abs_err_sum += float(t_mae.item())
+                    torsion_sq_err_sum += float(t_rmse.item() ** 2)
+                    torsion_count += 1
             A= torch.tensor(out,requires_grad=True)
             A = A.cpu().detach().numpy()
             B= torch.tensor(data.y, requires_grad=True)
@@ -798,6 +883,7 @@ def test(loader, epoch):
     else:
         avg_rmsd_per_pdb_in = None
 
+    elapsed = max(time() - t, 1e-8)
     metrics = {
         "val_loss": float(total_loss / pose_idx),
         "rmsd_mean_A": float(rmsd_arr_A.mean()),
@@ -811,6 +897,11 @@ def test(loader, epoch):
         "num_poses": int(pose_idx),
         "num_complexes": int(diff_complex),
         "avg_poses_per_complex": float(pose_idx / max(diff_complex, 1)),
+        "clash_rate": float(clash_rate_sum / max(pose_idx, 1)),
+        "clash_penalty": float(clash_penalty_sum / max(pose_idx, 1)),
+        "efficiency_pose_per_sec": float(pose_idx / elapsed),
+        "torsion_mae_rad": (float(torsion_abs_err_sum / torsion_count) if torsion_count > 0 else None),
+        "torsion_angular_rmse_rad": (float(math.sqrt(torsion_sq_err_sum / torsion_count)) if torsion_count > 0 else None),
     }
 
     per_complex = []
